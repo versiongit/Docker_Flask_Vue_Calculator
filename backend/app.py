@@ -5,17 +5,18 @@ from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
 
 app = Flask(__name__)
 CORS(app)
 
-# MongoDB Connection
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/calculator_db")
-client = MongoClient(MONGO_URI)
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://mongo:27017/calculator_db")
+
+# Add a 3-second timeout so it doesn't hang forever if MongoDB is down
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
 db = client.get_database()
 history_col = db["history"]
 
-# Safe Expression Evaluator (Avoids unsafe eval())
 ALLOWED_OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -33,7 +34,7 @@ def evaluate_node(node):
     elif isinstance(node, ast.Constant):
         if isinstance(node.value, (int, float)):
             return node.value
-        raise ValueError("Invalid constant type")
+        raise ValueError("Invalid constant")
     elif isinstance(node, ast.BinOp):
         left = evaluate_node(node.left)
         right = evaluate_node(node.right)
@@ -50,7 +51,7 @@ def evaluate_node(node):
             return ALLOWED_OPERATORS[op_type](operand)
         raise ValueError(f"Unsupported unary operator: {op_type.__name__}")
     else:
-        raise ValueError("Unsupported expression syntax")
+        raise ValueError("Unsupported syntax")
 
 def safe_calculate(expression: str):
     parsed = ast.parse(expression, mode='eval')
@@ -66,48 +67,54 @@ def calculate():
 
     try:
         result = safe_calculate(expr)
-        
         if isinstance(result, float) and result.is_integer():
             result = int(result)
         elif isinstance(result, float):
             result = round(result, 8)
 
-        record = {
-            "expression": expr,
-            "result": result,
-            "timestamp": datetime.now(timezone.utc)
-        }
-        inserted = history_col.insert_one(record)
+        # Try to save to MongoDB (won't crash the calculation if DB fails)
+        try:
+            history_col.insert_one({
+                "expression": expr,
+                "result": result,
+                "timestamp": datetime.now(timezone.utc)
+            })
+        except PyMongoError as db_err:
+            print(f"MongoDB save warning: {db_err}")
 
-        return jsonify({
-            "id": str(inserted.inserted_id),
-            "expression": expr,
-            "result": result
-        }), 200
+        return jsonify({"expression": expr, "result": result}), 200
 
     except ZeroDivisionError as e:
         return jsonify({"error": str(e)}), 400
     except Exception:
-        return jsonify({"error": "Invalid mathematical expression"}), 400
+        return jsonify({"error": "Invalid expression"}), 400
 
 @app.route("/api/history", methods=["GET"])
 def get_history():
-    records = list(history_col.find().sort("timestamp", -1).limit(20))
-    formatted = [
-        {
-            "id": str(r["_id"]),
-            "expression": r["expression"],
-            "result": r["result"],
-            "timestamp": r["timestamp"].strftime("%Y-%m-%d %H:%M:%S") if "timestamp" in r else ""
-        }
-        for r in records
-    ]
-    return jsonify(formatted), 200
+    try:
+        records = list(history_col.find().sort("timestamp", -1).limit(20))
+        formatted = [
+            {
+                "id": str(r["_id"]),
+                "expression": r["expression"],
+                "result": r["result"],
+                "timestamp": r["timestamp"].strftime("%Y-%m-%d %H:%M:%S") if "timestamp" in r else ""
+            }
+            for r in records
+        ]
+        return jsonify(formatted), 200
+    except ServerSelectionTimeoutError:
+        return jsonify({"error": "Database connection timed out"}), 503
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/history", methods=["DELETE"])
 def clear_history():
-    history_col.delete_many({})
-    return jsonify({"message": "History cleared successfully"}), 200
+    try:
+        history_col.delete_many({})
+        return jsonify({"message": "History cleared"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
