@@ -1,4 +1,4 @@
-# Docker_FastAPI_Vue_Calculator
+# Docker_Flask_Vue_Calculator
 
 ![Project Logo](images/image.png)
 
